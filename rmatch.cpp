@@ -1,9 +1,11 @@
 #include <cstddef>
+#include <cstdint>
 #include <fmt/core.h>
 #include <fmt/format.h>
 #include <list>
 #include <memory>
 #include <stdexcept>
+#include <stdint.h>
 #include <string>
 #include <string_view>
 #include <xbyak.h>
@@ -19,11 +21,25 @@ using fmt::print;
   factor  ::= '.' | char | escaped_char | '(' expr ')' ;
 */
 
-struct matcher : Xbyak::CodeGenerator {
+enum Instruction {
+  SPLIT,
+  MATCH,
+  JUMP,
+  BEGIN,
+  END,
+  ACCEPT,
+  LABEL,
+  ANY,
+  SINGLE,
+};
+
+struct Matcher : Xbyak::CodeGenerator {
   string re;
   string::const_iterator iter;
-  size_t label_id;
-  matcher(const string &re)
+  uint32_t label_id;
+  list<uint32_t> instructions;
+
+  Matcher(const string &re)
       : Xbyak::CodeGenerator(4096, Xbyak::AutoGrow), re(re),
         iter(this->re.cbegin()), label_id() {}
 
@@ -31,20 +47,21 @@ struct matcher : Xbyak::CodeGenerator {
 
   void next_iter() { iter++; }
 
-  string parse(size_t l) {
+  list<uint32_t> parse(size_t l) {
     switch (l) {
     case 0: {
-      string s;
+      list<uint32_t> inst;
       if (not_end() && *iter == '^') {
-        s += "    match ^\n";
+        inst.push_back(BEGIN);
         next_iter();
       }
-      s += parse(1);
+      auto r = parse(1);
+      inst.insert(inst.end(), r.cbegin(), r.cend());
       if (not_end() && *iter == '$') {
-        s += "    match $\n";
+        inst.push_back(END);
         next_iter();
       }
-      return s;
+      return inst;
     }
     case 1: {
       /*
@@ -56,26 +73,35 @@ struct matcher : Xbyak::CodeGenerator {
           ...
         l3:
       */
-      string s;
-      while (not_end() && *iter != '|' && *iter != ')')
-        s += parse(2);
+
+      list<uint32_t> inst;
+      while (not_end() && *iter != '|' && *iter != ')') {
+        auto r = parse(2);
+        inst.insert(inst.end(), r.cbegin(), r.cend());
+      }
       if (not_end() && *iter == '|') {
+        list<uint32_t> new_inst{SPLIT, label_id, label_id + 1, LABEL, label_id};
+        inst.insert(inst.begin(), new_inst.cbegin(), new_inst.cend());
+        inst.push_back(JUMP);
+        inst.push_back(label_id + 2);
+        inst.push_back(LABEL);
+        inst.push_back(label_id + 1);
         auto l3 = label_id + 2;
-        s = format("    split L{} L{}\nL{}:\n", label_id, label_id + 1,
-                   label_id) +
-            s + format("    jump L{}\nL{}:\n", label_id + 2, label_id + 1);
         label_id += 3;
         next_iter();
-        s += parse(1);
-        s += format("L{}:\n", l3);
+        auto r = parse(1);
+        inst.insert(inst.end(), r.cbegin(), r.cend());
+        inst.push_back(LABEL);
+        inst.push_back(l3);
       }
-      return s;
+      return inst;
     }
     case 2: {
-      string s;
+      list<uint32_t> inst;
       if (not_end() && *iter != '|' && *iter != ')' && *iter != '+' &&
           *iter != '*' && *iter != '?') {
-        s += parse(3);
+        auto r = parse(3);
+        inst.insert(inst.end(), r.cbegin(), r.cend());
       }
       if (not_end())
         switch (*iter) {
@@ -86,15 +112,18 @@ struct matcher : Xbyak::CodeGenerator {
               split l1 l2
             l2:
           */
-          s = format("L{}:\n", label_id) + s +
-              format("    split L{} L{}\nL{}:\n", label_id, label_id + 1,
-                     label_id + 1);
+          inst.push_front(LABEL);
+          inst.push_front(label_id);
+
+          list<uint32_t> new_inst{SPLIT, label_id, label_id + 1, LABEL,
+                                  label_id + 1};
+          inst.insert(inst.end(), new_inst.cbegin(), new_inst.cend());
           label_id += 2;
           next_iter();
-          return s;
+          return inst;
         }
 
-        case '*':
+        case '*': {
           /*
               split l1 l2
             l1:
@@ -102,14 +131,17 @@ struct matcher : Xbyak::CodeGenerator {
               split l1 l2
             l2:
           */
-          s = format("    split L{} L{}\nL{}:\n", label_id, label_id + 1,
-                     label_id) +
-              s +
-              format("    split L{} L{}\nL{}:\n", label_id, label_id + 1,
-                     label_id + 1);
+          list<uint32_t> new_inst1{SPLIT, label_id, label_id + 1, LABEL,
+                                   label_id};
+          list<uint32_t> new_inst2{SPLIT, label_id, label_id + 1, LABEL,
+                                   label_id + 1};
+
+          inst.insert(inst.begin(), new_inst1.cbegin(), new_inst1.cend());
+          inst.insert(inst.end(), new_inst2.cbegin(), new_inst2.cend());
           label_id += 2;
           next_iter();
-          return s;
+          return inst;
+        }
         case '?': {
           /*
               split l1 l2
@@ -117,53 +149,61 @@ struct matcher : Xbyak::CodeGenerator {
               ...
             l2:
           */
-          s = format("    split L{} L{}\nL{}:\n", label_id, label_id + 1,
-                     label_id) +
-              s + format("L{}:\n", label_id + 1);
+          list<uint32_t> new_inst{SPLIT, label_id, label_id + 1, LABEL,
+                                  label_id};
+          inst.insert(inst.begin(), new_inst.cbegin(), new_inst.cend());
+          inst.push_back(LABEL);
+          inst.push_back(label_id + 1);
           label_id += 2;
           next_iter();
-          return s;
+          return inst;
         }
         }
-      return s;
+      return inst;
     }
     case 3: {
-      string s;
+      list<uint32_t> inst;
       if (!not_end())
-        return s;
+        return inst;
       switch (*iter) {
       case '.':
-        s += "   any";
+        inst.push_back(ANY);
         next_iter();
-        return s;
+        return inst;
       case '\\':
         next_iter();
         if (iter == re.cend())
           throw runtime_error(
               "escaped character reaches the end of expression");
-        s += format("    match '{}'\n", *iter);
+        inst.push_back(SINGLE);
+        inst.push_back(*iter);
         next_iter();
-        return s;
-      case '(':
+        return inst;
+      case '(': {
         next_iter();
-        s += parse(1);
+        auto r = parse(1);
+        inst.insert(inst.begin(), r.cbegin(), r.cend());
         if (!not_end() || *iter != ')')
           throw runtime_error("");
         next_iter();
-        return s;
+        return inst;
+      }
       default:
-        s += format("    match '{}'\n", *iter);
+        inst.push_back(SINGLE);
+        inst.push_back(*iter);
         next_iter();
-        return s;
+        return inst;
       }
     }
     }
-    return "";
+    return {};
   }
 };
 
 int main() {
   string re("(a|b)*abb+c?");
-  matcher match(re);
-  print("{}", match.parse(0));
+  Matcher match(re);
+  for (auto &&i : match.parse(0)) {
+    print("{}\n", i);
+  }
 }
