@@ -1,0 +1,6 @@
+[submodule "fmt"]
+	path = fmt
+	url = https://github.com/fmtlib/fmt
+[submodule "xbyak"]
+	path = xbyak
+	url = https://github.com/herumi/xbyak
