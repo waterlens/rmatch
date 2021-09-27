@@ -10,6 +10,10 @@
 #include <string_view>
 #include <xbyak.h>
 
+#ifdef XBYAK32
+#error "this matcher is for only 64-bit mode"
+#endif
+
 using namespace std;
 using fmt::format;
 using fmt::print;
@@ -33,15 +37,17 @@ enum Instruction {
   SINGLE,
 };
 
-struct Matcher : Xbyak::CodeGenerator {
+struct Compiler : Xbyak::CodeGenerator {
+  Compiler() : Xbyak::CodeGenerator(4096, Xbyak::AutoGrow) {}
+};
+
+struct Matcher {
   string re;
   string::const_iterator iter;
   uint32_t label_id;
   list<uint32_t> instructions;
 
-  Matcher(const string &re)
-      : Xbyak::CodeGenerator(4096, Xbyak::AutoGrow), re(re),
-        iter(this->re.cbegin()), label_id() {}
+  Matcher(const string &re) : re(re), iter(this->re.cbegin()), label_id() {}
 
   bool not_end() { return iter != re.cend(); }
 
