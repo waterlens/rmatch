@@ -3,6 +3,7 @@
 #include <cstdio>
 #include <fmt/core.h>
 #include <fmt/format.h>
+#include <ios>
 #include <list>
 #include <memory>
 #include <stdexcept>
@@ -27,56 +28,20 @@ using fmt::print;
   factor  ::= '.' | char | escaped_char | '(' expr ')' ;
 */
 
-/*
-  entry:
-    ; allocate stack frame
-    mov   a0, st.p[0]
-  reach_string_end:
-    movzx eax, byte ptr [a0]
-    jnz   run
-  match_fail:
-    xor   eax, eax
-  match_return:
-    ; clear stack and return
-  backtrack:
-    cmp   rsp, rbp
-    je    match_fail
-    pop   a0
-    pop   r9
-    jmp   r9
-
-*/
-
 enum Instruction {
-  /*
-    push  L2
-    push  a0
-    jmp   L1
-   */
   SPLIT,
-  /*
-    cmp   byte ptr [a0], `char`
-    jne   thread_fail
-    inc   a0
-   */
+  SPLIT_ONE,
   SINGLE,
-  /*
-    movzx eax, byte ptr [a0]
-    jz    thread_fail
-    inc   a0
-   */
   ANY,
-  /*
-    jmp L1
-   */
   JUMP,
-  /*
-    mov   eax, 1
-    jmp   match_return
-   */
   ACCEPT,
   LABEL,
 };
+
+string_view name[] = {
+    "SPLIT", "SPLIT_ONE", "SINGLE", "ANY", "JUMP", "ACCEPT", "LABEL",
+};
+
 using match_prototype = bool (*)(const char *);
 
 struct Compiler : Xbyak::CodeGenerator {
@@ -85,11 +50,12 @@ struct Compiler : Xbyak::CodeGenerator {
     vector<uint32_t> linear_inst(instructions.cbegin(), instructions.cend());
     Xbyak::util::StackFrame sf(this, 1, 0, 0, false);
     const auto &a0 = sf.p[0];
+    setDefaultJmpNEAR(true);
     L("reach_string_end");
     {
-      movzx(eax, byte[a0]);
       push(rbp);
       mov(rbp, rsp);
+      movzx(eax, byte[a0]);
       jmp("run");
     }
     L("match_fail");
@@ -114,13 +80,21 @@ struct Compiler : Xbyak::CodeGenerator {
     for (size_t i = 0; i < linear_inst.size();) {
       switch (linear_inst[i]) {
       case SPLIT:
+        s = format("L{}", linear_inst.at(i + 2));
+        mov(rax, s.c_str());
+        sub(rsp, 16);
+        mov(ptr[rsp], a0);
+        mov(ptr[rsp + 8], rax);
+        jmp(format("L{}", linear_inst.at(i + 1)));
+        i += 3;
+        break;
+      case SPLIT_ONE:
         s = format("L{}", linear_inst.at(i + 1));
         mov(rax, s.c_str());
         sub(rsp, 16);
         mov(ptr[rsp], a0);
         mov(ptr[rsp + 8], rax);
-        jmp(format("L{}", linear_inst.at(i + 2)));
-        i += 3;
+        i += 2;
         break;
       case SINGLE:
         cmp(byte[a0], linear_inst.at(i + 1));
@@ -152,12 +126,105 @@ struct Compiler : Xbyak::CodeGenerator {
   }
 };
 
-struct Matcher {
+struct Optimizer {
+  list<uint32_t> &instructions;
+  Optimizer(list<uint32_t> &instructions) : instructions(instructions) {}
+  void optimize() { split_jump_fusion(); }
+
+  template <int n> void skip(list<uint32_t>::iterator &iter) {
+    if constexpr (n <= 0)
+      return;
+    else {
+      iter++;
+      skip<n - 1>(iter);
+    }
+  }
+
+  void dump() {
+    list<uint32_t>::iterator l1, l2;
+    print("-------------\n");
+    for (auto iter = instructions.begin(); iter != instructions.end();) {
+      switch (*iter) {
+      case SPLIT:
+        l1 = ++iter;
+        l2 = ++iter;
+        print("  {} L{} L{}\n", name[SPLIT], *l1, *l2);
+        ++iter;
+        break;
+      case SPLIT_ONE:
+        l2 = ++iter;
+        print("  {} L{}\n", name[SPLIT_ONE], *l2);
+        ++iter;
+        break;
+      case LABEL:
+        l1 = ++iter;
+        print("L{}:\n", *l1);
+        ++iter;
+        break;
+      case JUMP:
+        l2 = ++iter;
+        print("  {} L{}\n", name[JUMP], *l2);
+        ++iter;
+        break;
+      case SINGLE:
+        l2 = ++iter;
+        print("  {} {}\n", name[SINGLE], (char)*l2);
+        ++iter;
+        break;
+      case ANY:
+        print("  {}\n", name[ANY]);
+        ++iter;
+        break;
+      case ACCEPT:
+        print("  {}\n", name[ACCEPT]);
+        ++iter;
+        break;
+      }
+    }
+  }
+
+  void split_jump_fusion() {
+    for (auto iter = instructions.begin(); iter != instructions.end();) {
+      switch (*iter) {
+      case SPLIT: {
+        auto split = iter; // SPLIT
+        auto l1 = ++iter;  // L1
+        auto l2 = ++iter;  // L2
+        ++iter;            // LABEL
+        if (iter != instructions.end() && *iter == LABEL) {
+          auto label = iter;
+          auto lt = ++iter;
+          if (*lt == *l1) { // need fusion
+            instructions.erase(l1);
+            *split = SPLIT_ONE;
+          }
+          ++iter;
+        } else {
+          skip<2>(iter);
+        }
+        break;
+      }
+      case SPLIT_ONE:
+      case LABEL:
+      case JUMP:
+      case SINGLE:
+        skip<2>(iter);
+        break;
+      case ANY:
+      case ACCEPT:
+        skip<1>(iter);
+        break;
+      }
+    }
+  }
+};
+
+struct Parser {
   string re;
   string::const_iterator iter;
   uint32_t label_id;
 
-  Matcher(const string &re) : re(re), iter(this->re.cbegin()), label_id() {}
+  Parser(const string &re) : re(re), iter(this->re.cbegin()), label_id() {}
 
   bool not_end() { return iter != re.cend(); }
 
@@ -173,15 +240,6 @@ struct Matcher {
       return inst;
     }
     case 1: {
-      /*
-          split l1 l2
-        l1:
-          ...
-          jump l3
-        l2:
-          ...
-        l3:
-      */
 
       list<uint32_t> inst;
       while (not_end() && *iter != '|' && *iter != ')') {
@@ -215,12 +273,6 @@ struct Matcher {
       if (not_end())
         switch (*iter) {
         case '+': {
-          /*
-            l1:
-              ...
-              split l1 l2
-            l2:
-          */
           inst.push_front(LABEL);
           inst.push_front(label_id);
 
@@ -233,18 +285,10 @@ struct Matcher {
         }
 
         case '*': {
-          /*
-              split l1 l2
-            l1:
-              ...
-              split l1 l2
-            l2:
-          */
           list<uint32_t> new_inst1{SPLIT, label_id, label_id + 1, LABEL,
                                    label_id};
           list<uint32_t> new_inst2{SPLIT, label_id, label_id + 1, LABEL,
                                    label_id + 1};
-
           inst.insert(inst.begin(), new_inst1.cbegin(), new_inst1.cend());
           inst.insert(inst.end(), new_inst2.cbegin(), new_inst2.cend());
           label_id += 2;
@@ -252,12 +296,6 @@ struct Matcher {
           return inst;
         }
         case '?': {
-          /*
-              split l1 l2
-            l1:
-              ...
-            l2:
-          */
           list<uint32_t> new_inst{SPLIT, label_id, label_id + 1, LABEL,
                                   label_id};
           inst.insert(inst.begin(), new_inst.cbegin(), new_inst.cend());
@@ -310,12 +348,14 @@ struct Matcher {
 };
 
 int main() {
-  string re("(a|b)");
-  Matcher matcher(re);
+  string re("(a|b)*d?c(0|1|2|3|4|5|6|7|8|9)12345678");
+  Parser matcher(re);
+  auto inst = matcher.parse(0);
+  Optimizer opt(inst);
+  opt.optimize();
   Compiler compiler;
-  compiler.compile(matcher.parse(0));
+  compiler.compile(opt.instructions);
   compiler.readyRE();
   auto f = compiler.getCode<match_prototype>();
   fwrite(compiler.getCode(), 1, compiler.getSize(), stdout);
-  return f("a");
 }
