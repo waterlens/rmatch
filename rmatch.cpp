@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -7,7 +8,6 @@
 #include <list>
 #include <memory>
 #include <stdexcept>
-#include <stdint.h>
 #include <string>
 #include <string_view>
 #include <xbyak.h>
@@ -22,7 +22,6 @@ using fmt::format;
 using fmt::print;
 
 /*
-  regex   ::= '^'? expr '$'? ;
   expr    ::= term+ ('|' expr)? ;
   term    ::= factor ('+' | '*' | '?')? ;
   factor  ::= '.' | char | escaped_char | '(' expr ')' ;
@@ -32,6 +31,7 @@ enum Instruction {
   SPLIT,
   SPLIT_ONE,
   SINGLE,
+  CHARSET,
   ANY,
   JUMP,
   ACCEPT,
@@ -39,16 +39,26 @@ enum Instruction {
 };
 
 string_view name[] = {
-    "SPLIT", "SPLIT_ONE", "SINGLE", "ANY", "JUMP", "ACCEPT", "LABEL",
+    "SPLIT", "SPLIT_ONE", "SINGLE", "CHARSET", "ANY", "JUMP", "ACCEPT", "LABEL",
 };
 
 using match_prototype = bool (*)(const char *);
 
-struct Compiler : Xbyak::CodeGenerator {
-  Compiler() : Xbyak::CodeGenerator(4096, Xbyak::AutoGrow) {}
-  void compile(const list<uint32_t> &instructions) {
+pair<char, char> extract_char_pair(uint32_t i) {
+  return {(char)(i >> 8), (char)i};
+}
+
+uint32_t pack_char_pair(const pair<char, char> &p) {
+  uint32_t c = p.first;
+  return c << 8 | (uint32_t)p.second;
+}
+
+struct Codegen : Xbyak::CodeGenerator {
+  Codegen() : Xbyak::CodeGenerator(4096, Xbyak::AutoGrow) {}
+  void gen(const list<uint32_t> &instructions) {
     vector<uint32_t> linear_inst(instructions.cbegin(), instructions.cend());
-    Xbyak::util::StackFrame sf(this, 1, 0, 0, false);
+    Xbyak::util::StackFrame sf(
+        this, 1, Xbyak::util::UseRCX | Xbyak::util::UseRDX, 0, false);
     const auto &a0 = sf.p[0];
     setDefaultJmpNEAR(true);
     L("reach_string_end");
@@ -56,7 +66,8 @@ struct Compiler : Xbyak::CodeGenerator {
       push(rbp);
       mov(rbp, rsp);
       movzx(eax, byte[a0]);
-      jmp("run");
+      cmp(al, 0);
+      jnz("run");
     }
     L("match_fail");
     { xor_(eax, eax); }
@@ -82,18 +93,16 @@ struct Compiler : Xbyak::CodeGenerator {
       case SPLIT:
         s = format("L{}", linear_inst.at(i + 2));
         mov(rax, s.c_str());
-        sub(rsp, 16);
-        mov(ptr[rsp], a0);
-        mov(ptr[rsp + 8], rax);
+        push(rax);
+        push(a0);
         jmp(format("L{}", linear_inst.at(i + 1)));
         i += 3;
         break;
       case SPLIT_ONE:
         s = format("L{}", linear_inst.at(i + 1));
         mov(rax, s.c_str());
-        sub(rsp, 16);
-        mov(ptr[rsp], a0);
-        mov(ptr[rsp + 8], rax);
+        push(rax);
+        push(a0);
         i += 2;
         break;
       case SINGLE:
@@ -102,9 +111,34 @@ struct Compiler : Xbyak::CodeGenerator {
         inc(a0);
         i += 2;
         break;
+      case CHARSET: {
+        i += 1;
+        int n = linear_inst.at(i);
+        i += 1;
+        xor_(eax, eax);
+        movzx(edx, byte[a0]);
+        cmp(dl, 0);
+        jz("thread_fail");
+        for (int j = 0; j < n; ++j, ++i) {
+          auto [c1, c2] = extract_char_pair(linear_inst.at(i));
+          if (c1 == c2) {
+            cmp(dl, c1);
+            sete(cl);
+            or_(al, cl);
+          } else {
+            lea(ecx, ptr[rdx - c1]);
+            cmp(cl, c2 - c1);
+            setbe(cl);
+            or_(al, cl);
+          }
+        }
+        jz("thread_fail");
+        inc(a0);
+        break;
+      }
       case ANY:
-        movzx(eax, byte[a0]);
-        jnz("thread_fail");
+        cmp(byte[a0], 0);
+        jz("thread_fail");
         inc(a0);
         i += 1;
         break;
@@ -142,7 +176,7 @@ struct Optimizer {
 
   void dump() {
     list<uint32_t>::iterator l1, l2;
-    print("-------------\n");
+    print("--------------------------\n");
     for (auto iter = instructions.begin(); iter != instructions.end();) {
       switch (*iter) {
       case SPLIT:
@@ -171,6 +205,23 @@ struct Optimizer {
         print("  {} {}\n", name[SINGLE], (char)*l2);
         ++iter;
         break;
+      case CHARSET: {
+        int n = *++iter;
+        ++iter;
+        string s;
+        for (int i = 0; i < n; ++i, ++iter) {
+          auto [c1, c2] = extract_char_pair(*iter);
+          if (c1 == c2)
+            s.push_back(c1);
+          else {
+            s.push_back(c1);
+            s.push_back('-');
+            s.push_back(c2);
+          }
+        }
+        print("  {} {}\n", name[CHARSET], s);
+        break;
+      }
       case ANY:
         print("  {}\n", name[ANY]);
         ++iter;
@@ -210,6 +261,13 @@ struct Optimizer {
       case SINGLE:
         skip<2>(iter);
         break;
+      case CHARSET: {
+        ++iter;
+        auto n = *iter;
+        for (int i = 0; i < n + 1; ++i)
+          ++iter;
+        break;
+      }
       case ANY:
       case ACCEPT:
         skip<1>(iter);
@@ -223,12 +281,23 @@ struct Parser {
   string re;
   string::const_iterator iter;
   uint32_t label_id;
+  vector<pair<char, char>> char_range;
+  vector<pair<char, char>> char_range_res;
 
   Parser(const string &re) : re(re), iter(this->re.cbegin()), label_id() {}
 
   bool not_end() { return iter != re.cend(); }
 
   void next_iter() { iter++; }
+
+  char escaped(string::const_iterator iter, string::const_iterator end) {
+    if (*iter == '\\' && ++iter != end) {
+      return *iter;
+    }
+    if (iter == end)
+      throw runtime_error("escaped sequence followed by EOF");
+    return *iter;
+  }
 
   list<uint32_t> parse(size_t l) {
     switch (l) {
@@ -273,8 +342,8 @@ struct Parser {
       if (not_end())
         switch (*iter) {
         case '+': {
-          inst.push_front(LABEL);
           inst.push_front(label_id);
+          inst.push_front(LABEL);
 
           list<uint32_t> new_inst{SPLIT, label_id, label_id + 1, LABEL,
                                   label_id + 1};
@@ -318,12 +387,8 @@ struct Parser {
         next_iter();
         return inst;
       case '\\':
-        next_iter();
-        if (iter == re.cend())
-          throw runtime_error(
-              "escaped character reaches the end of expression");
         inst.push_back(SINGLE);
-        inst.push_back(*iter);
+        inst.push_back(escaped(iter, re.cend()));
         next_iter();
         return inst;
       case '(': {
@@ -331,7 +396,48 @@ struct Parser {
         auto r = parse(1);
         inst.insert(inst.begin(), r.cbegin(), r.cend());
         if (!not_end() || *iter != ')')
-          throw runtime_error("");
+          throw runtime_error("invalid tokens after '('");
+        next_iter();
+        return inst;
+      }
+      case '[': {
+        next_iter();
+        if (!not_end() || *iter == ']')
+          throw runtime_error("invalid tokens after '['");
+        char_range.clear();
+        char_range_res.clear();
+        while (*iter != ']') {
+          char c1 = escaped(iter, re.cend());
+          char c2 = c1;
+          next_iter();
+          if (iter != re.cend() && iter + 1 != re.cend() && *iter == '-' &&
+              *(iter + 1) != ']') {
+            next_iter();
+            c2 = escaped(iter, re.cend());
+            if (c2 <= c1)
+              throw runtime_error(
+                  "the lower bound is larger than the upper bound");
+            next_iter();
+          }
+          char_range.emplace_back(c1, c2);
+        }
+        sort(char_range.begin(), char_range.end(),
+             [](pair<char, char> &p1, pair<char, char> &p2) {
+               return p1.first < p2.first;
+             });
+
+        char_range_res.push_back(char_range.at(0));
+        for (int i = 1; i < char_range.size(); ++i) {
+          if (char_range_res.back().second < char_range[i].first)
+            char_range_res.push_back(char_range[i]);
+          else
+            char_range_res.back().second =
+                max(char_range_res.back().second, char_range[i].second);
+        }
+        inst.push_back(CHARSET);
+        inst.push_back((uint32_t)char_range_res.size());
+        for (auto &&p : char_range_res)
+          inst.push_back(pack_char_pair(p));
         next_iter();
         return inst;
       }
@@ -348,14 +454,15 @@ struct Parser {
 };
 
 int main() {
-  string re("(a|b)*d?c(0|1|2|3|4|5|6|7|8|9)12345678");
+  string re("[\\]]*");
   Parser matcher(re);
   auto inst = matcher.parse(0);
   Optimizer opt(inst);
   opt.optimize();
-  Compiler compiler;
-  compiler.compile(opt.instructions);
-  compiler.readyRE();
-  auto f = compiler.getCode<match_prototype>();
-  fwrite(compiler.getCode(), 1, compiler.getSize(), stdout);
+  Codegen codegen;
+  codegen.gen(opt.instructions);
+  codegen.readyRE();
+  auto f = codegen.getCode<match_prototype>();
+  fwrite(codegen.getCode(), 1, codegen.getSize(), stdout);
+  return f("]]]");
 }
