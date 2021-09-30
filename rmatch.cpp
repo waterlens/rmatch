@@ -24,7 +24,7 @@ using fmt::print;
 /*
   expr    ::= term+ ('|' expr)? ;
   term    ::= factor ('+' | '*' | '?')? ;
-  factor  ::= '.' | char | escaped_char | '(' expr ')' ;
+  factor  ::= '.' | char | escaped_char | char_set | '(' expr ')' ;
 */
 
 enum Instruction {
@@ -163,7 +163,10 @@ struct Codegen : Xbyak::CodeGenerator {
 struct Optimizer {
   list<uint32_t> &instructions;
   Optimizer(list<uint32_t> &instructions) : instructions(instructions) {}
-  void optimize() { split_jump_fusion(); }
+  void optimize() {
+    split_jump_fusion();
+    single_fusion();
+  }
 
   template <int n> void skip(list<uint32_t>::iterator &iter) {
     if constexpr (n <= 0)
@@ -229,6 +232,33 @@ struct Optimizer {
       case ACCEPT:
         print("  {}\n", name[ACCEPT]);
         ++iter;
+        break;
+      }
+    }
+  }
+
+  void single_fusion() {
+    for (auto iter = instructions.begin(); iter != instructions.end();) {
+      switch (*iter) {
+      case SPLIT:
+        skip<3>(iter);
+        break;
+      case SPLIT_ONE:
+      case LABEL:
+      case JUMP:
+      case SINGLE:
+        skip<2>(iter);
+        break;
+      case CHARSET: {
+        ++iter;
+        auto n = *iter;
+        for (int i = 0; i < n + 1; ++i)
+          ++iter;
+        break;
+      }
+      case ANY:
+      case ACCEPT:
+        skip<1>(iter);
         break;
       }
     }
