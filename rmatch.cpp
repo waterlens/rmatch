@@ -5,11 +5,13 @@
 #include <fmt/core.h>
 #include <fmt/format.h>
 #include <ios>
+#include <iterator>
 #include <list>
 #include <memory>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <vector>
 #include <xbyak.h>
 #include <xbyak_util.h>
 
@@ -36,10 +38,12 @@ enum Instruction {
   JUMP,
   ACCEPT,
   LABEL,
+  STRING,
 };
 
 string_view name[] = {
-    "SPLIT", "SPLIT_ONE", "SINGLE", "CHARSET", "ANY", "JUMP", "ACCEPT", "LABEL",
+    "SPLIT", "SPLIT_ONE", "SINGLE", "CHARSET", "ANY",
+    "JUMP",  "ACCEPT",    "LABEL",  "STRING",
 };
 
 using match_prototype = bool (*)(const char *);
@@ -53,10 +57,16 @@ uint32_t pack_char_pair(const pair<char, char> &p) {
   return c << 8 | (uint32_t)p.second;
 }
 
+struct IR {
+  list<uint32_t> instructions;
+  vector<string> string_pool;
+};
+
 struct Codegen : Xbyak::CodeGenerator {
   Codegen() : Xbyak::CodeGenerator(4096, Xbyak::AutoGrow) {}
-  void gen(const list<uint32_t> &instructions) {
-    vector<uint32_t> linear_inst(instructions.cbegin(), instructions.cend());
+  void gen(const IR &ir) {
+    vector<uint32_t> linear_inst(ir.instructions.cbegin(),
+                                 ir.instructions.cend());
     Xbyak::util::StackFrame sf(
         this, 1, Xbyak::util::UseRCX | Xbyak::util::UseRDX, 0, false);
     const auto &a0 = sf.p[0];
@@ -155,29 +165,59 @@ struct Codegen : Xbyak::CodeGenerator {
         L(format("L{}", linear_inst.at(i + 1)));
         i += 2;
         break;
+      case STRING: {
+        const auto &s = ir.string_pool[linear_inst.at(i + 1)];
+        auto p = s.data();
+        auto len = s.length();
+        while (len > 0) {
+          if (len >= 8) {
+            auto i = *reinterpret_cast<const uint64_t *>(p);
+            mov(rax, i);
+            cmp(rax, qword[a0]);
+            jne("thread_fail");
+            add(a0, 8);
+            len -= 8;
+            p += 8;
+          } else if (len >= 4) {
+            auto i = *reinterpret_cast<const uint32_t *>(p);
+            cmp(dword[a0], i);
+            jne("thread_fail");
+            add(a0, 4);
+            len -= 4;
+            p += 4;
+          } else if (len >= 2) {
+            auto i = *reinterpret_cast<const uint16_t *>(p);
+            cmp(word[a0], i);
+            jne("thread_fail");
+            add(a0, 2);
+            len -= 2;
+            p += 2;
+          } else {
+            cmp(byte[a0], *p);
+            jne("thread_fail");
+            inc(a0);
+            len--;
+            p++;
+          }
+        }
+        i += 2;
+        break;
+      }
       }
     }
   }
 };
 
 struct Optimizer {
-  list<uint32_t> &instructions;
-  Optimizer(list<uint32_t> &instructions) : instructions(instructions) {}
+  IR ir;
+  Optimizer(IR &ir) : ir(ir) {}
   void optimize() {
     split_jump_fusion();
     single_fusion();
   }
 
-  template <int n> void skip(list<uint32_t>::iterator &iter) {
-    if constexpr (n <= 0)
-      return;
-    else {
-      iter++;
-      skip<n - 1>(iter);
-    }
-  }
-
   void dump() {
+    auto &instructions = ir.instructions;
     list<uint32_t>::iterator l1, l2;
     print("--------------------------\n");
     for (auto iter = instructions.begin(); iter != instructions.end();) {
@@ -233,22 +273,50 @@ struct Optimizer {
         print("  {}\n", name[ACCEPT]);
         ++iter;
         break;
+      case STRING: {
+        ++iter;
+        auto &s = ir.string_pool[*iter++];
+        print("  {} {}\n", name[STRING], s);
+        break;
+      }
+      default:
+        throw runtime_error("unexpected instruction");
       }
     }
   }
 
   void single_fusion() {
+    auto &instructions = ir.instructions;
     for (auto iter = instructions.begin(); iter != instructions.end();) {
       switch (*iter) {
       case SPLIT:
-        skip<3>(iter);
+        advance(iter, 3);
         break;
       case SPLIT_ONE:
       case LABEL:
       case JUMP:
-      case SINGLE:
-        skip<2>(iter);
+      case STRING:
+        advance(iter, 2);
         break;
+      case SINGLE: {
+        auto single_begin = iter++;
+        auto ch = *iter++;
+        string s{(char)ch};
+        for (; iter != instructions.end() && *iter == SINGLE;) {
+          s.push_back(*++iter);
+          ++iter;
+        }
+        if (s.length() == 1)
+          break;
+        else {
+          auto next_single = next(single_begin, 2);
+          instructions.erase(next_single, iter);
+          *single_begin++ = STRING;
+          *single_begin = ir.string_pool.size();
+          ir.string_pool.emplace_back(s);
+        }
+        break;
+      }
       case CHARSET: {
         ++iter;
         auto n = *iter;
@@ -258,13 +326,16 @@ struct Optimizer {
       }
       case ANY:
       case ACCEPT:
-        skip<1>(iter);
+        advance(iter, 1);
         break;
+      default:
+        throw runtime_error("unexpected instruction");
       }
     }
   }
 
   void split_jump_fusion() {
+    auto &instructions = ir.instructions;
     for (auto iter = instructions.begin(); iter != instructions.end();) {
       switch (*iter) {
       case SPLIT: {
@@ -281,7 +352,7 @@ struct Optimizer {
           }
           ++iter;
         } else {
-          skip<2>(iter);
+          advance(iter, 2);
         }
         break;
       }
@@ -289,19 +360,21 @@ struct Optimizer {
       case LABEL:
       case JUMP:
       case SINGLE:
-        skip<2>(iter);
+      case STRING:
+        advance(iter, 2);
         break;
       case CHARSET: {
         ++iter;
         auto n = *iter;
-        for (int i = 0; i < n + 1; ++i)
-          ++iter;
+        advance(iter, n + 1);
         break;
       }
       case ANY:
       case ACCEPT:
-        skip<1>(iter);
+        ++iter;
         break;
+      default:
+        throw runtime_error("unexpected instruction");
       }
     }
   }
@@ -328,6 +401,8 @@ struct Parser {
       throw runtime_error("escaped sequence followed by EOF");
     return *iter;
   }
+
+  IR parse_all() { return {parse(0)}; }
 
   list<uint32_t> parse(size_t l) {
     switch (l) {
@@ -484,15 +559,15 @@ struct Parser {
 };
 
 int main() {
-  string re("[\\]]*");
-  Parser matcher(re);
-  auto inst = matcher.parse(0);
-  Optimizer opt(inst);
+  string re("abcdefg");
+  Parser parser(re);
+  auto ir = parser.parse_all();
+  Optimizer opt(ir);
   opt.optimize();
   Codegen codegen;
-  codegen.gen(opt.instructions);
+  codegen.gen(opt.ir);
   codegen.readyRE();
   auto f = codegen.getCode<match_prototype>();
   fwrite(codegen.getCode(), 1, codegen.getSize(), stdout);
-  return f("]]]");
+  return f("abcdefg");
 }
