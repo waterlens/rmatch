@@ -1,13 +1,19 @@
+#include <Zycore/Types.h>
+#include <Zydis/Zydis.h>
 #include <algorithm>
+#include <chrono>
+#include <cinttypes>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <fmt/core.h>
 #include <fmt/format.h>
 #include <ios>
+#include <iostream>
 #include <iterator>
 #include <list>
 #include <memory>
+#include <regex>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -71,7 +77,7 @@ struct Codegen : Xbyak::CodeGenerator {
         this, 1, Xbyak::util::UseRCX | Xbyak::util::UseRDX, 0, false);
     const auto &a0 = sf.p[0];
     setDefaultJmpNEAR(true);
-    L("reach_string_end");
+    L("entry");
     {
       push(rbp);
       mov(rbp, rsp);
@@ -96,7 +102,6 @@ struct Codegen : Xbyak::CodeGenerator {
       jmp(r9);
     }
     L("run");
-    Xbyak::Label l;
     string s;
     for (size_t i = 0; i < linear_inst.size();) {
       switch (linear_inst[i]) {
@@ -393,7 +398,7 @@ struct Parser {
 
   void next_iter() { iter++; }
 
-  char escaped(string::const_iterator iter, string::const_iterator end) {
+  char escaped(string::const_iterator &iter, string::const_iterator end) {
     if (*iter == '\\' && ++iter != end) {
       return *iter;
     }
@@ -558,16 +563,86 @@ struct Parser {
   }
 };
 
+constexpr int N = 100000000;
+
+int bench(match_prototype f, const char *s) {
+  int sum = 0;
+  for (size_t i = 0; i < N; ++i) {
+    sum += f(s);
+  }
+  return sum;
+}
+string_view rs1 = R"([0-9a-zA-Z_.+-]+@[0-9a-zA-Z_.-]+\.[0-9a-zA-Z_.-]+)";
+string_view rs2 = R"(((25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.)((25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.)((25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.)(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?))";
+
+string_view rs = rs2;
+
+regex stl_regex(rs.data(),
+                regex_constants::ECMAScript | regex_constants::optimize);
+
+int bench_stl(const char *s) {
+  int sum = 0;
+  for (size_t i = 0; i < N; ++i) {
+    sum += regex_match(s, stl_regex);
+  }
+  return sum;
+}
+
 int main() {
-  string re("abcdefg");
+  string re(rs);
   Parser parser(re);
   auto ir = parser.parse_all();
   Optimizer opt(ir);
+  opt.dump();
   opt.optimize();
+  opt.dump();
   Codegen codegen;
   codegen.gen(opt.ir);
   codegen.readyRE();
   auto f = codegen.getCode<match_prototype>();
-  fwrite(codegen.getCode(), 1, codegen.getSize(), stdout);
-  return f("abcdefg");
+  // --------------------------------------------------------------------
+  auto fp = fopen("dynbin", "wb");
+  fwrite(codegen.getCode(), 1, codegen.getSize(), fp);
+  fclose(fp);
+  // --------------------------------------------------------------------
+  auto data = codegen.getCode<ZyanU8 *>();
+  ZydisDecoder decoder;
+  ZydisDecoderInit(&decoder, ZYDIS_MACHINE_MODE_LONG_64,
+                   ZYDIS_ADDRESS_WIDTH_64);
+  ZydisFormatter formatter;
+  ZydisFormatterInit(&formatter, ZYDIS_FORMATTER_STYLE_INTEL);
+  ZyanU64 runtime_address = reinterpret_cast<ZyanU64>(data);
+  ZyanUSize offset = 0;
+  ZyanUSize length = codegen.getSize();
+  ZydisDecodedInstruction instruction;
+  while (ZYAN_SUCCESS(ZydisDecoderDecodeBuffer(
+      &decoder, data + offset, length - offset, &instruction))) {
+    printf("%016" PRIX64 "  ", runtime_address);
+    char buffer[256];
+    ZydisFormatterFormatInstruction(&formatter, &instruction, buffer,
+                                    sizeof(buffer), runtime_address);
+    puts(buffer);
+    offset += instruction.length;
+    runtime_address += instruction.length;
+  }
+  print("------------------------\n");
+  auto t1 = chrono::steady_clock::now();
+  auto r = bench(f, "192.168.1.1");
+  auto t2 = chrono::steady_clock::now();
+  print("{} {}\n", r, chrono::duration<double>(t2 - t1).count());
+  print("------------------------\n");
+  t1 = chrono::steady_clock::now();
+  r = bench_stl("192.168.1.1");
+  t2 = chrono::steady_clock::now();
+  print("{} {}\n", r, chrono::duration<double>(t2 - t1).count());
+  print("------------------------\n");
+
+  for (;;) {
+    string s;
+    if (!getline(cin, s))
+      return 0;
+    print("{}\n", f(s.c_str()));
+  }
+
+  return 0;
 }

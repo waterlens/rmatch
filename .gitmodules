@@ -4,3 +4,6 @@
 [submodule "xbyak"]
 	path = xbyak
 	url = https://github.com/herumi/xbyak
+[submodule "zydis"]
+	path = zydis
+	url = https://github.com/zyantific/zydis
